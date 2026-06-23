@@ -1,0 +1,563 @@
+이 문제의 핵심은 **SSRF + 내부 API 우회**야.
+
+코드 흐름을 천천히 보면:
+
+```python
+@app.route('/get_info', methods=['GET', 'POST'])
+def get_info():
+    userid = request.form.get('userid', '')
+    info = requests.get(f'{API_HOST}/api/user/{userid}').text
+```
+
+사용자가 `userid`를 넣으면 서버가 직접 아래 주소로 요청을 보내:
+
+```text
+http://127.0.0.1:8000/api/user/{userid}
+```
+
+여기서 중요한 점은 사용자가 직접 `/api/flag`에 접근하면 막힌다는 거야.
+
+```python
+def internal_api(func):
+    if request.remote_addr == '127.0.0.1':
+        return func(*args, **kwargs)
+    else:
+        abort(401)
+```
+
+즉 `/api`, `/api/user/<uid>`, `/api/flag`는 **127.0.0.1에서 온 요청만 허용**돼.
+
+그런데 `/get_info`는 외부 사용자가 접근 가능하고, 내부에서 `requests.get()`으로 `127.0.0.1`에 요청을 보내지?
+
+그래서 서버 입장에서는:
+
+```text
+사용자 -> /get_info
+서버 -> 127.0.0.1 내부 API 요청
+```
+
+이렇게 돼. 이게 바로 **SSRF(Server-Side Request Forgery)**야.  
+외부 사용자가 서버를 시켜서 내부 주소에 요청하게 만드는 취약점.
+
+---
+
+문제는 원래 이런 요청만 의도했어:
+
+```text
+userid=0
+```
+
+그러면 서버가 요청하는 주소는:
+
+```text
+http://127.0.0.1:8000/api/user/0
+```
+
+결과:
+
+```json
+{"userid": "guest", "level": 1, "password": "guest"}
+```
+
+또는:
+
+```text
+userid=1
+```
+
+요청 주소:
+
+```text
+http://127.0.0.1:8000/api/user/1
+```
+
+결과:
+
+```json
+{"userid": "admin", "level": 9999, "password": "admin"}
+```
+
+근데 플래그는 여기에 있어:
+
+```python
+@app.route('/api/flag')
+@internal_api
+def flag():
+    return FLAG
+```
+
+즉 서버가 내부에서 이 주소를 요청하게 만들면 돼:
+
+```text
+http://127.0.0.1:8000/api/flag
+```
+
+현재 우리가 조작할 수 있는 부분은 `{userid}` 부분이니까:
+
+```text
+http://127.0.0.1:8000/api/user/{userid}
+```
+
+여기서 `userid`에 이런 값을 넣어볼 수 있어:
+
+```text
+../flag
+```
+
+그러면 URL은:
+
+```text
+http://127.0.0.1:8000/api/user/../flag
+```
+
+경로에서 `../`는 상위 디렉터리로 올라간다는 뜻이야.
+
+```text
+/api/user/../flag
+```
+
+이건 정규화되면:
+
+```text
+/api/flag
+```
+
+결국 서버가 내부에서 `/api/flag`를 요청하게 되고, `request.remote_addr`는 `127.0.0.1`이므로 검사를 통과해.
+
+---
+
+정리하면 공격 흐름은 이거야:
+
+1. 사용자는 `/api/flag`에 직접 접근할 수 없음
+2. 하지만 `/get_info`는 접근 가능함
+3. `/get_info`는 사용자의 입력을 붙여서 내부 API에 요청함
+4. `userid=../flag`를 넣으면 내부 요청 경로가 `/api/flag`로 바뀜
+5. 서버가 자기 자신에게 요청했으므로 `127.0.0.1` 체크를 통과함
+6. FLAG 출력
+
+그래서 입력값으로는 보통:
+
+```text
+../flag
+```
+
+를 넣어보면 돼.
+
+개념적으로는 “내가 못 들어가는 내부 방에, 서버 심부름꾼을 보내서 대신 문을 열게 한다”에 가까워. 이 문제에서는 그 심부름꾼이 `requests.get()`이고, 문지기가 `request.remote_addr == '127.0.0.1'` 검사야.
+
+
+괜찮아 ㅠ 처음 보면 진짜 낯설어. 이 문제는 한 문장으로 말하면:
+
+**내가 직접 못 보는 `/api/flag`를, 서버한테 대신 보게 만드는 문제**야.
+
+## 1. 먼저 등장인물부터
+
+이 Flask 서버에는 페이지가 몇 개 있어.
+
+```text
+/
+```
+
+메인 페이지.
+
+```text
+/get_info
+```
+
+사용자가 `userid`를 입력하는 페이지.
+
+```text
+/api/user/<uid>
+```
+
+유저 정보를 보여주는 내부 API.
+
+```text
+/api/flag
+```
+
+플래그가 있는 내부 API.
+
+여기서 중요한 건 `/api/flag`야. 플래그가 여기 있음.
+
+---
+
+## 2. 그런데 `/api/flag`는 그냥 못 봐
+
+이 코드 때문이야.
+
+```python
+def internal_api(func):
+    def decorated_view(*args, **kwargs):
+        if request.remote_addr == '127.0.0.1':
+            return func(*args, **kwargs)
+        else:
+            abort(401)
+```
+
+뜻은 이거야:
+
+```text
+요청한 사람이 127.0.0.1이면 통과
+아니면 401 에러
+```
+
+`127.0.0.1`은 쉽게 말해서 **서버 자기 자신**이야.
+
+즉 서버가 이렇게 말하는 거야:
+
+```text
+/api/flag는 서버 자기 자신만 볼 수 있어.
+외부 사용자는 못 봐.
+```
+
+그래서 우리가 브라우저에서 직접:
+
+```text
+/api/flag
+```
+
+로 들어가면 막혀.
+
+---
+
+## 3. 근데 `/get_info`가 수상해
+
+여기를 봐.
+
+```python
+@app.route('/get_info', methods=['GET', 'POST'])
+def get_info():
+    userid = request.form.get('userid', '')
+    info = requests.get(f'{API_HOST}/api/user/{userid}').text
+```
+
+사용자가 `userid`를 입력하면 서버가 내부에서 이 주소로 요청을 보내:
+
+```text
+http://127.0.0.1:8000/api/user/입력값
+```
+
+예를 들어 네가 입력창에 `0`을 넣으면 서버는 이렇게 요청해:
+
+```text
+http://127.0.0.1:8000/api/user/0
+```
+
+그럼 guest 정보가 나와.
+
+입력창에 `1`을 넣으면:
+
+```text
+http://127.0.0.1:8000/api/user/1
+```
+
+admin 정보가 나와.
+
+여기까지는 정상 기능이야.
+
+---
+
+## 4. 중요한 착각 포인트
+
+우리는 `/api/flag`를 직접 못 봐.
+
+하지만 `/get_info` 기능은 서버가 대신 요청을 보내줘.
+
+그림으로 보면 이래.
+
+```text
+내가 직접 /api/flag 요청
+나 -> 서버 /api/flag
+결과: 막힘
+```
+
+왜 막히냐면 요청한 사람이 내가 되기 때문이야.
+
+그런데 `/get_info`는:
+
+```text
+나 -> 서버 /get_info 에 userid 입력
+서버 -> 서버 자기 자신에게 내부 요청
+결과: 통과 가능
+```
+
+서버가 자기 자신한테 요청하면 주소가 `127.0.0.1`이니까 검사에 통과해.
+
+이걸 **SSRF**라고 불러.
+
+SSRF는 어렵게 느껴지지만 뜻은 간단해:
+
+```text
+내가 직접 요청하는 게 아니라,
+서버한테 부탁해서 서버가 대신 요청하게 만드는 공격
+```
+
+---
+
+## 5. 그럼 어떻게 `/api/flag`를 보게 만들까?
+
+서버가 만드는 주소는 원래 이런 모양이야.
+
+```text
+http://127.0.0.1:8000/api/user/{userid}
+```
+
+우리가 조작할 수 있는 건 `{userid}` 부분뿐이야.
+
+예를 들어 `userid`에 `0`을 넣으면:
+
+```text
+http://127.0.0.1:8000/api/user/0
+```
+
+근데 우리는 최종적으로 이 주소가 되게 하고 싶어:
+
+```text
+http://127.0.0.1:8000/api/flag
+```
+
+여기서 사용하는 게 `../`야.
+
+`../`는 경로에서 **한 칸 위로 올라가라**는 뜻이야.
+
+예를 들어:
+
+```text
+/api/user/../flag
+```
+
+이건 이렇게 정리돼:
+
+```text
+/api/flag
+```
+
+왜냐하면:
+
+```text
+/api/user/../flag
+```
+
+에서 `user/..`는 “user 폴더로 갔다가 다시 위로 올라감”이니까 사라져.
+
+그래서 결국:
+
+```text
+/api/flag
+```
+
+가 되는 거야.
+
+---
+
+## 6. 그래서 입력값은?
+
+`userid` 입력창에 이렇게 넣으면 돼.
+
+```text
+../flag
+```
+
+그러면 서버 내부 요청은 이렇게 만들어져.
+
+```text
+http://127.0.0.1:8000/api/user/../flag
+```
+
+이 주소는 정리되면:
+
+```text
+http://127.0.0.1:8000/api/flag
+```
+
+그리고 이 요청은 **서버가 서버 자신에게 보내는 요청**이라서 `127.0.0.1` 검사 통과.
+
+그래서 플래그가 나와.
+
+---
+
+## 7. 진짜 핵심만 다시
+
+이 문제를 아주 짧게 요약하면:
+
+```text
+/api/flag는 외부에서 직접 접근하면 막힘
+/get_info는 서버가 내부 주소로 대신 요청해줌
+userid에 ../flag를 넣으면 내부 요청 주소가 /api/flag로 바뀜
+서버가 자기 자신에게 요청한 거라 통과
+FLAG 출력
+```
+
+머릿속 그림은 이거 하나면 돼.
+
+```text
+내가 직접 감: /api/flag
+-> 외부 요청이라 막힘
+
+서버한테 시킴: /get_info에 ../flag 입력
+-> 서버가 내부에서 /api/flag 요청
+-> 내부 요청이라 성공
+```
+
+입력값:
+
+```text
+../flag
+```
+
+처음에는 “왜 `../flag`가 갑자기 flag로 가?” 이 부분이 제일 헷갈려.  
+그냥 `../`를 **뒤로가기 버튼**이라고 생각하면 좋아.
+
+```text
+/api/user/../flag
+```
+
+는
+
+```text
+/api/user 에서 한 칸 뒤로 가고 flag로 이동
+```
+
+그래서
+
+```text
+/api/flag
+```
+
+가 되는 거야.
+
+
+---
+---
+---
+# Dreamhack - Path Traversal Write-Up
+
+## 문제 개요
+
+본 문제는 Flask 기반 웹 애플리케이션에서 발생하는 Path Traversal 취약점을 이용하여 내부 API에 접근하고 FLAG를 획득하는 문제이다.
+
+---
+
+## 취약점 분석
+
+### 1. 내부 API 접근 제한 확인
+
+코드를 분석한 결과 `/api`, `/api/user/<uid>`, `/api/flag` 경로에는 `internal_api()` 데코레이터가 적용되어 있었다.
+
+```python
+def internal_api(func):
+    if request.remote_addr == '127.0.0.1':
+        return func(*args, **kwargs)
+    else:
+        abort(401)
+```
+
+해당 로직은 localhost(127.0.0.1)에서 발생한 요청만 허용하도록 구성되어 있어 외부 사용자는 직접 `/api/flag`에 접근할 수 없다.
+
+---
+
+### 2. 사용자 입력 처리 로직 분석
+
+`/get_info` 기능을 확인한 결과 사용자가 입력한 userid 값을 내부 API 요청 경로에 그대로 사용하고 있었다.
+
+```python
+userid = request.form.get('userid', '')
+info = requests.get(
+    f'{API_HOST}/api/user/{userid}'
+).text
+```
+
+따라서 사용자가 조작한 값이 내부 API 경로에 직접 포함될 수 있음을 확인하였다.
+
+---
+
+### 3. 클라이언트 측 JavaScript 분석
+
+페이지 소스를 확인한 결과 입력값을 다음과 같이 변환하는 JavaScript 코드가 존재하였다.
+
+```javascript
+const users = {
+    'guest': 0,
+    'admin': 1
+}
+
+function user(evt){
+    document.getElementById('userid').value =
+        users[document.getElementById('userid').value]
+}
+```
+
+사용자가 입력한 `guest`, `admin` 값은 제출 시 각각 `0`, `1`로 변환되어 서버로 전송되었다.
+
+Network 탭에서 확인한 결과 실제 전송 데이터는 다음과 같았다.
+
+```text
+userid=0
+```
+
+---
+
+### 4. 우회 방법 탐색
+
+입력창에 직접 `../flag`를 입력해도 JavaScript에 의해 값이 변환되어 원하는 요청이 발생하지 않았다.
+
+이를 우회하기 위해 브라우저 개발자 도구(Console)를 이용하여 users 객체에 새로운 항목을 추가하였다.
+
+```javascript
+users['../flag'] = '../flag'
+```
+
+이후 입력창에 다음 값을 입력하였다.
+
+```text
+../flag
+```
+
+---
+
+## 공격 수행
+
+최종적으로 서버는 다음 URL로 내부 요청을 수행하였다.
+
+```text
+http://127.0.0.1:8000/api/user/../flag
+```
+
+경로 정규화(Path Normalization) 과정에서
+
+```text
+/api/user/../flag
+```
+
+는
+
+```text
+/api/flag
+```
+
+로 해석된다.
+
+결과적으로 서버는 localhost 권한으로 `/api/flag`에 접근하게 되었고 FLAG를 획득할 수 있었다.
+
+---
+
+## 핵심 개념
+
+* Path Traversal (`../`)
+* URL Path Normalization
+* Client-Side Validation Bypass
+* Internal API Access Control
+* Flask Routing Analysis
+* Browser Developer Tools 활용
+* Network Payload 분석
+
+---
+
+## 학습 내용
+
+이번 문제를 통해 단순히 입력값을 변경하는 것뿐만 아니라, 클라이언트 측 JavaScript 동작을 분석하고 우회하는 방법을 학습하였다. 또한 Path Traversal이 내부 API 접근 우회와 결합될 경우 민감 정보 노출로 이어질 수 있음을 확인하였다.
+
+
+
+
